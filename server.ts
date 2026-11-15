@@ -3,7 +3,6 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import path from 'node:path';
 import crypto from 'node:crypto';
 import multer from 'multer';
-import { createServer as createViteServer } from 'vite';
 import { EventEmitter } from 'node:events';
 import { askFitBaseConcierge, type ChatTurn } from './server/aiConcierge.ts';
 import {
@@ -16,7 +15,6 @@ import {
 import {
   addDaysIso,
   computeDaysRemaining,
-  ensureUploadsDir,
   getGymClasses,
   getMemberProfiles,
   getNotificationSettings,
@@ -40,7 +38,6 @@ import {
   sanitizeBiometricRow,
   TIER_DURATION_DAYS,
   TIER_FEES,
-  UPLOADS_DIR,
   type StoredBiometricRow,
 } from './server/store.ts';
 import type {
@@ -66,19 +63,9 @@ interface AuthedRequest extends Request {
   authUser?: UserProfile;
 }
 
-ensureUploadsDir();
-
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    ensureUploadsDir();
-    cb(null, UPLOADS_DIR);
-  },
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname || '').toLowerCase() || '.png';
-    const safeExt = ['.png', '.jpg', '.jpeg', '.webp', '.pdf', '.svg'].includes(ext) ? ext : '.png';
-    cb(null, `receipt-${Date.now()}-${crypto.randomBytes(4).toString('hex')}${safeExt}`);
-  },
-});
+// Receipts are held in memory and pushed to Supabase Storage (Vercel's filesystem is read-only).
+const RECEIPT_BUCKET = process.env.SUPABASE_RECEIPT_BUCKET || 'receipts';
+const storage = multer.memoryStorage();
 
 const upload = multer({
   storage,
@@ -401,12 +388,9 @@ async function nextMemberCode(): Promise<string> {
   return `FB-${base}-${crypto.randomInt(10, 99)}`;
 }
 
-async function startServer() {
+export function createApp() {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
-
-  // Serve uploaded payment receipts
-  app.use('/uploads', express.static(UPLOADS_DIR));
 
   // Public Supabase browser config (URL + non-secret Anon key only)
   app.get('/api/public/config', (_req, res) => {
@@ -1177,6 +1161,18 @@ async function startServer() {
         const parsedAmount = Number(amountPkr) || user.monthlyFeePkr || 7000;
         const supabase = getSupabaseAdmin();
 
+        let receiptUrl: string | null = null;
+        if (req.file) {
+          const ext = path.extname(req.file.originalname || '').toLowerCase();
+          const safeExt = ['.png', '.jpg', '.jpeg', '.webp', '.pdf', '.svg'].includes(ext) ? ext : '.png';
+          const objectPath = `${user.id}/receipt-${Date.now()}-${crypto.randomBytes(4).toString('hex')}${safeExt}`;
+          const { error: upErr } = await supabase.storage
+            .from(RECEIPT_BUCKET)
+            .upload(objectPath, req.file.buffer, { contentType: req.file.mimetype, upsert: false });
+          if (upErr) throw new Error(`Receipt upload failed: ${upErr.message}`);
+          receiptUrl = supabase.storage.from(RECEIPT_BUCKET).getPublicUrl(objectPath).data.publicUrl;
+        }
+
         const { data: insertedPay, error: payErr } = await supabase
           .from('payment_submissions')
           .insert({
@@ -1189,7 +1185,7 @@ async function startServer() {
             amount_pkr: parsedAmount,
             method,
             transaction_ref: transactionRef.trim(),
-            receipt_url: req.file ? `/uploads/${req.file.filename}` : null,
+            receipt_url: receiptUrl,
             receipt_file_name: req.file ? req.file.originalname : null,
             notes: notes?.trim() || '',
             status: 'Pending',
@@ -2972,6 +2968,20 @@ async function startServer() {
     }
   );
 
+  // Vercel Cron target (vercel.json "crons"). Vercel sends: Authorization: Bearer $CRON_SECRET
+  app.get('/api/cron/sweep', async (req, res, next) => {
+    try {
+      const secret = process.env.CRON_SECRET;
+      if (!secret || req.header('Authorization') !== `Bearer ${secret}`) {
+        res.status(401).json({ error: 'Unauthorized cron invocation.' });
+        return;
+      }
+      res.json(await runExpirationSweep('Daily Cron'));
+    } catch (err) {
+      next(err);
+    }
+  });
+
   // Handle errors cleanly (Supabase configuration errors -> 503)
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     if (err instanceof SupabaseConfigError) {
@@ -2985,7 +2995,18 @@ async function startServer() {
     res.status(500).json({ error: 'Unexpected server error.' });
   });
 
+  return app;
+}
+
+// ---------------------------------------------------------------------------
+// Local / self-hosted runtime (never used on Vercel): Vite dev middleware,
+// static serving, in-process cron tick and app.listen.
+// ---------------------------------------------------------------------------
+async function startServer() {
+  const app = createApp();
+
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -2999,7 +3020,6 @@ async function startServer() {
     });
   }
 
-  // Daily Subscription Expiration & WhatsApp Notification Scheduler
   const checkDailyCron = async () => {
     if (!isSupabaseConfigured()) return;
     try {
@@ -3026,4 +3046,7 @@ async function startServer() {
   });
 }
 
-startServer();
+// Only boot the long-running server when this file is the entry point (npm run dev / start).
+if (!process.env.VERCEL && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
+  void startServer();
+}

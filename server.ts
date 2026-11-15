@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import crypto from 'node:crypto';
 import multer from 'multer';
 import { EventEmitter } from 'node:events';
@@ -3047,6 +3048,6 @@ async function startServer() {
 }
 
 // Only boot the long-running server when this file is the entry point (npm run dev / start).
-if (!process.env.VERCEL && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
+if (!process.env.VERCEL && process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   void startServer();
 }

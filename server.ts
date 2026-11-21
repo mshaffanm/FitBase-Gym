@@ -1,9 +1,9 @@
 import 'dotenv/config';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 import crypto from 'node:crypto';
 import multer from 'multer';
+import { createServer as createViteServer } from 'vite';
 import { EventEmitter } from 'node:events';
 import { askFitBaseConcierge, type ChatTurn } from './server/aiConcierge.ts';
 import {
@@ -16,6 +16,7 @@ import {
 import {
   addDaysIso,
   computeDaysRemaining,
+  ensureUploadsDir,
   getGymClasses,
   getMemberProfiles,
   getNotificationSettings,
@@ -39,6 +40,7 @@ import {
   sanitizeBiometricRow,
   TIER_DURATION_DAYS,
   TIER_FEES,
+  UPLOADS_DIR,
   type StoredBiometricRow,
 } from './server/store.ts';
 import type {
@@ -57,6 +59,49 @@ import type {
 } from './src/types.ts';
 
 const PORT = Number(process.env.PORT || 3000);
+
+// ---- Plan period helpers: due dates follow the member's plan in CALENDAR months ----
+function planMonths(tier: string): number {
+  const t = (tier || '').toLowerCase();
+  if (t.startsWith('12')) return 12;
+  if (t.startsWith('6')) return 6;
+  if (t.startsWith('3')) return 3;
+  return 1; // Official Package, Student Package, anything else = 1 month
+}
+
+/** Adds whole calendar months (Jan 31 + 1 month = Feb 28/29). Input/output are YYYY-MM-DD. */
+function addMonthsIso(isoDate: string, months: number): string {
+  const [y, m, d] = isoDate.slice(0, 10).split('-').map(Number);
+  const total = (m - 1) + months;
+  const ny = y + Math.floor(total / 12);
+  const nm = ((total % 12) + 12) % 12;
+  const lastDay = new Date(Date.UTC(ny, nm + 1, 0)).getUTCDate();
+  const nd = Math.min(d, lastDay);
+  return `${ny}-${String(nm + 1).padStart(2, '0')}-${String(nd).padStart(2, '0')}`;
+}
+
+/** Next due date after a payment: counts from the current end date if still in the future,
+ *  otherwise from today (expired members restart from the day they pay). */
+function nextDueDate(currentEnd: string | undefined | null, tier: string): string {
+  const today = new Date().toISOString().slice(0, 10);
+  const anchor = currentEnd && currentEnd > today ? currentEnd : today;
+  return addMonthsIso(anchor, planMonths(tier));
+}
+
+/** Members whose plan end date has passed can no longer be 'Paid'. */
+async function syncExpiredFeeStatuses() {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    await getSupabaseAdmin()
+      .from('profiles')
+      .update({ fee_status: 'Overdue' })
+      .eq('role', 'member')
+      .eq('fee_status', 'Paid')
+      .lt('subscription_end_date', today);
+  } catch {
+    // non-fatal
+  }
+}
 const biometricEventBus = new EventEmitter();
 biometricEventBus.setMaxListeners(50);
 
@@ -64,9 +109,19 @@ interface AuthedRequest extends Request {
   authUser?: UserProfile;
 }
 
-// Receipts are held in memory and pushed to Supabase Storage (Vercel's filesystem is read-only).
-const RECEIPT_BUCKET = process.env.SUPABASE_RECEIPT_BUCKET || 'receipts';
-const storage = multer.memoryStorage();
+ensureUploadsDir();
+
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => {
+    ensureUploadsDir();
+    cb(null, UPLOADS_DIR);
+  },
+  filename: (_req, file, cb) => {
+    const ext = path.extname(file.originalname || '').toLowerCase() || '.png';
+    const safeExt = ['.png', '.jpg', '.jpeg', '.webp', '.pdf', '.svg'].includes(ext) ? ext : '.png';
+    cb(null, `receipt-${Date.now()}-${crypto.randomBytes(4).toString('hex')}${safeExt}`);
+  },
+});
 
 const upload = multer({
   storage,
@@ -389,9 +444,12 @@ async function nextMemberCode(): Promise<string> {
   return `FB-${base}-${crypto.randomInt(10, 99)}`;
 }
 
-export function createApp() {
+async function startServer() {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
+
+  // Serve uploaded payment receipts
+  app.use('/uploads', express.static(UPLOADS_DIR));
 
   // Public Supabase browser config (URL + non-secret Anon key only)
   app.get('/api/public/config', (_req, res) => {
@@ -592,7 +650,7 @@ export function createApp() {
       const trainers = await getTrainers();
       const memberCode = await nextMemberCode();
       const today = new Date().toISOString().slice(0, 10);
-      const endDate = addDaysIso(today, TIER_DURATION_DAYS[tier] || 30);
+      const endDate = addMonthsIso(today, planMonths(tier));
 
       const { data: insertedProfile, error: profileError } = await supabaseAdmin
         .from('profiles')
@@ -1162,18 +1220,6 @@ export function createApp() {
         const parsedAmount = Number(amountPkr) || user.monthlyFeePkr || 7000;
         const supabase = getSupabaseAdmin();
 
-        let receiptUrl: string | null = null;
-        if (req.file) {
-          const ext = path.extname(req.file.originalname || '').toLowerCase();
-          const safeExt = ['.png', '.jpg', '.jpeg', '.webp', '.pdf', '.svg'].includes(ext) ? ext : '.png';
-          const objectPath = `${user.id}/receipt-${Date.now()}-${crypto.randomBytes(4).toString('hex')}${safeExt}`;
-          const { error: upErr } = await supabase.storage
-            .from(RECEIPT_BUCKET)
-            .upload(objectPath, req.file.buffer, { contentType: req.file.mimetype, upsert: false });
-          if (upErr) throw new Error(`Receipt upload failed: ${upErr.message}`);
-          receiptUrl = supabase.storage.from(RECEIPT_BUCKET).getPublicUrl(objectPath).data.publicUrl;
-        }
-
         const { data: insertedPay, error: payErr } = await supabase
           .from('payment_submissions')
           .insert({
@@ -1186,7 +1232,7 @@ export function createApp() {
             amount_pkr: parsedAmount,
             method,
             transaction_ref: transactionRef.trim(),
-            receipt_url: receiptUrl,
+            receipt_url: req.file ? `/uploads/${req.file.filename}` : null,
             receipt_file_name: req.file ? req.file.originalname : null,
             notes: notes?.trim() || '',
             status: 'Pending',
@@ -1266,6 +1312,7 @@ export function createApp() {
   // Admin Portal: Overview Payload
   app.get('/api/admin/overview', requireAuth, requireAdmin, async (_req, res, next) => {
     try {
+      await syncExpiredFeeStatuses();
       const supabase = getSupabaseAdmin();
       const [
         members,
@@ -1359,6 +1406,7 @@ export function createApp() {
   // Reception & Staff Operations Overview
   app.get('/api/reception/overview', requireAuth, requireStaff, async (_req, res, next) => {
     try {
+      await syncExpiredFeeStatuses();
       const supabase = getSupabaseAdmin();
       const [
         members,
@@ -1562,7 +1610,7 @@ export function createApp() {
         const today = new Date().toISOString().slice(0, 10);
         const memberCode = await nextMemberCode();
         const resolvedEndDate =
-          subscriptionEndDate?.trim() || addDaysIso(today, TIER_DURATION_DAYS[tier] || 30);
+          subscriptionEndDate?.trim() || addMonthsIso(today, planMonths(tier));
 
         const { data: insertedProfile, error: profErr } = await supabase
           .from('profiles')
@@ -1715,6 +1763,19 @@ export function createApp() {
         }
         if (typeof membershipActive === 'boolean') patch.membership_active = membershipActive;
         if (typeof staffNotes === 'string') patch.staff_notes = staffNotes.trim();
+
+        // Fee status follows the plan end date when staff change the end date or switch the
+        // account to Active (future end date => Paid, past end date => Overdue).
+        const endChanged =
+          typeof patch.subscription_end_date === 'string' &&
+          patch.subscription_end_date !== member.subscriptionEndDate;
+        const reactivated = membershipActive === true && member.membershipActive === false;
+        if (endChanged || reactivated) {
+          const effectiveEnd = (patch.subscription_end_date as string) || member.subscriptionEndDate || '';
+          const todayIso = new Date().toISOString().slice(0, 10);
+          patch.fee_status = effectiveEnd && effectiveEnd >= todayIso ? 'Paid' : 'Overdue';
+          if (patch.fee_status === 'Paid') patch.fee_paid_through = effectiveEnd.slice(0, 7);
+        }
 
         const supabase = getSupabaseAdmin();
         const { data: updated, error } = await supabase
@@ -2486,12 +2547,7 @@ export function createApp() {
         const member = await getProfileById(payment.memberId);
         if (member) {
           if (action === 'approve') {
-            const today = new Date().toISOString().slice(0, 10);
-            const anchor =
-              member.subscriptionEndDate && member.subscriptionEndDate > today
-                ? member.subscriptionEndDate
-                : today;
-            const nextEnd = addDaysIso(anchor, TIER_DURATION_DAYS[member.membershipTier] || 30);
+            const nextEnd = nextDueDate(member.subscriptionEndDate, member.membershipTier);
 
             await supabase
               .from('profiles')
@@ -2543,11 +2599,7 @@ export function createApp() {
 
         if (recordCashPayment) {
           const method: PaymentMethod = paymentMethod || 'Cash';
-          const anchor =
-            member.subscriptionEndDate && member.subscriptionEndDate > today
-              ? member.subscriptionEndDate
-              : today;
-          const nextEnd = addDaysIso(anchor, TIER_DURATION_DAYS[member.membershipTier] || 30);
+          const nextEnd = nextDueDate(member.subscriptionEndDate, member.membershipTier);
           const now = new Date().toISOString();
 
           await supabase.from('payment_submissions').insert({
@@ -2969,20 +3021,6 @@ export function createApp() {
     }
   );
 
-  // Vercel Cron target (vercel.json "crons"). Vercel sends: Authorization: Bearer $CRON_SECRET
-  app.get('/api/cron/sweep', async (req, res, next) => {
-    try {
-      const secret = process.env.CRON_SECRET;
-      if (!secret || req.header('Authorization') !== `Bearer ${secret}`) {
-        res.status(401).json({ error: 'Unauthorized cron invocation.' });
-        return;
-      }
-      res.json(await runExpirationSweep('Daily Cron'));
-    } catch (err) {
-      next(err);
-    }
-  });
-
   // Handle errors cleanly (Supabase configuration errors -> 503)
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     if (err instanceof SupabaseConfigError) {
@@ -2996,18 +3034,7 @@ export function createApp() {
     res.status(500).json({ error: 'Unexpected server error.' });
   });
 
-  return app;
-}
-
-// ---------------------------------------------------------------------------
-// Local / self-hosted runtime (never used on Vercel): Vite dev middleware,
-// static serving, in-process cron tick and app.listen.
-// ---------------------------------------------------------------------------
-async function startServer() {
-  const app = createApp();
-
   if (process.env.NODE_ENV !== 'production') {
-    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -3021,6 +3048,7 @@ async function startServer() {
     });
   }
 
+  // Daily Subscription Expiration & WhatsApp Notification Scheduler
   const checkDailyCron = async () => {
     if (!isSupabaseConfigured()) return;
     try {
@@ -3047,7 +3075,4 @@ async function startServer() {
   });
 }
 
-// Only boot the long-running server when this file is the entry point (npm run dev / start).
-if (!process.env.VERCEL && process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
-  void startServer();
-}
+startServer();
